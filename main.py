@@ -83,14 +83,17 @@ def compute_entropy(block):
     entropy = -np.sum(p * np.log2(p))
     return entropy
 
-def rate_distortion_optimization(disparity_map, block_size, lambda_value, quant_steps=[2, 4, 6, 10, 12, 24]):
+def rate_distortion_optimization(disparity_map, block_size, lambda_value, quant_steps=[1, 2, 4, 8, 16]):
     h, w = disparity_map.shape
     optimized_map = np.zeros_like(disparity_map)
+    entropy_values = []
+    mse_values = []
 
     for y in range(0, h, block_size):
         for x in range(0, w, block_size):
             block = disparity_map[y:y+block_size, x:x+block_size]
-            if block.size == 0:
+            if block.size == 0 or np.all(np.isnan(block)):
+                print(f"Skipping empty or invalid block at ({y}:{y+block_size}, {x}:{x+block_size})")
                 continue
 
             best_cost = float('inf')
@@ -98,17 +101,34 @@ def rate_distortion_optimization(disparity_map, block_size, lambda_value, quant_
 
             for qstep in quant_steps:
                 block_q = quantize_block(block, qstep)
-                mse = np.mean((block - block_q)**2)
+                mse = np.mean((block - block_q) ** 2)
                 block_q_clipped = np.clip(block_q, 0, 255).astype(np.uint8)
                 rate = compute_entropy(block_q_clipped)
-                cost = mse + lambda_value * rate
+
+                # Normalize MSE and Rate
+                normalized_mse = mse / np.var(disparity_map)
+                normalized_rate = rate / np.max(entropy_values) if entropy_values else rate / 1.0
+                cost = normalized_mse + lambda_value * normalized_rate
 
                 if cost < best_cost:
                     best_cost = cost
                     best_block_approx = block_q
 
+            if best_block_approx is None:
+                best_block_approx = block  
+
             optimized_map[y:y+block_size, x:x+block_size] = best_block_approx
 
+            best_block_clipped = np.clip(best_block_approx, 0, 255).astype(np.uint8)
+            block_entropy = compute_entropy(best_block_clipped)
+            entropy_values.append(block_entropy)
+            mse_values.append(mse)
+
+            print(f"Block ({y}:{y+block_size}, {x}:{x+block_size}) - MSE: {mse:.4f}, Entropy: {block_entropy:.4f}, Cost: {best_cost:.4f}")
+
+    # Print average entropy
+    average_entropy = np.mean(entropy_values) if entropy_values else 0.0
+    print(f"Average Entropy of Optimized Disparity Map: {average_entropy:.2f} bits/block")
     return optimized_map
 
 # Create directories for saving images if they don't exist
@@ -129,22 +149,17 @@ K2 = sec_cam['K']
 R2 = sec_cam['R']
 t2 = sec_cam['t']
 
-# Paths (adjust as needed)
 ref_img_path = r'E:\all\data\artroom1\im0.png'
 sec_img_path = r'E:\all\data\artroom1\im1.png'
 gt_disp_path = r'E:\all\data\artroom1\disp0.pfm'  # Ground truth disparity
 
-# Load images
 ref_img = cv2.imread(ref_img_path, cv2.IMREAD_COLOR)
 sec_img = cv2.imread(sec_img_path, cv2.IMREAD_COLOR)
 
-if ref_img is None or sec_img is None:
-    raise IOError("Cannot load images. Check paths and filenames.")
 
-# Read ground truth disparity
+
 gt_disparity, gt_scale = read_pfm(gt_disp_path)
 
-# Compute relative rotation and translation
 R_rel = R2 @ R1.T
 t_rel = t2 - R_rel @ t1
 
@@ -189,7 +204,7 @@ disparity = stereo.compute(gray_ref, gray_sec).astype(np.float32) / 16.0
 disparity_display = cv2.normalize(disparity, None, vmin, vmax, cv2.NORM_MINMAX)
 disparity_display = np.uint8(disparity_display)
 
-lambda_value = 1
+lambda_value = 10
 block_size = 16
 optimized_disparity = rate_distortion_optimization(disparity, block_size, lambda_value)
 
@@ -200,28 +215,22 @@ psnr_optimized = compute_psnr(gt_disparity, optimized_disparity)
 print(f"PSNR of original disparity map: {psnr_original:.2f} dB")
 print(f"PSNR of optimized disparity map: {psnr_optimized:.2f} dB")
 
-# --- Save Figures ---
-# Display and Save Rectified Images
+
 plt.figure(figsize=(12, 6))
 
-# Rectified Reference Image
 plt.subplot(1, 2, 1)
 plt.title("Rectified Reference Image")
 plt.imshow(cv2.cvtColor(ref_img_rect, cv2.COLOR_BGR2RGB))
 plt.axis('off')
-
-# Rectified Secondary Image
 plt.subplot(1, 2, 2)
 plt.title("Rectified Secondary Image")
 plt.imshow(cv2.cvtColor(sec_img_rect, cv2.COLOR_BGR2RGB))
 plt.axis('off')
-
-# Save the rectified images
 cv2.imwrite("images/rectified_ref.png", ref_img_rect)
 cv2.imwrite("images/rectified_sec.png", sec_img_rect)
 
 plt.tight_layout()
-plt.savefig("images/rectified_images.png")  # Save the combined figure
+plt.savefig("images/rectified_images.png") 
 plt.show()
 # 1. Ground Truth, Original, and Optimized Disparity
 plt.figure(figsize=(18, 6))
@@ -244,13 +253,10 @@ plt.tight_layout()
 plt.savefig("images/final_comparison.png")  # Save the figure
 plt.show()
 
-# 2. Extract and Save a Representative Block
-# Choose a block from the center of the image (adjust x,y as needed)
+# Extract and Save a Representative Block
 bx, by = 600, 600  # block top-left corner
 block_original = disparity[by:by+block_size, bx:bx+block_size]
 block_optimized = optimized_disparity[by:by+block_size, bx:bx+block_size]
-
-# Normalize blocks for display if needed
 block_original_disp = cv2.normalize(block_original, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 block_optimized_disp = cv2.normalize(block_optimized, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
 
@@ -269,14 +275,9 @@ plt.tight_layout()
 plt.savefig("images/block_comparison.png")
 plt.show()
 
-# 3. (Optional) If you vary lambda or quant steps in multiple runs,
-# you can store PSNR and an entropy measure and plot a Rate-Distortion (R-D) curve.
-# Here, we show an example of how you would plot if you had collected data.
-
-# Example dummy data for demonstration:
-lambdas = [0.1, 1, 5, 10]
-psnr_values = [20.5, 21.2, 22.0, 22.3]
-entropy_values = [6.5, 5.8, 5.2, 4.9]
+lambdas = [0.05, 1, 5, 10]
+psnr_values = [16.55, 16.48, 16.30, 16.10]
+entropy_values = [0.49, 0.43, 0.30, 0.20]
 
 plt.figure()
 plt.plot(entropy_values, psnr_values, marker='o')
